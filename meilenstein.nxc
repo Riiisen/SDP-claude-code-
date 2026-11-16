@@ -1,0 +1,726 @@
+// =====================================================================
+// meilenstein.nxc - Linienfolger fuer den SDP-Meilenstein (NXT, NXC)
+// =====================================================================
+// Geschrieben mit Claude (09.11.2026). NICHT getestet: Alle Parameter
+// muessen auf eurem Roboter und an der Testbahn eingestellt werden.
+//
+// Aufgabe (Regelwerk Kap. 7): Linie folgen bis zur Wand, wenden,
+// zurueck bis zum Ziel, dort stehen bleiben. Keine Hindernisse.
+//
+// Aufbau (Fotos 09.11.2026): drei Lichtsensoren direkt nebeneinander
+// vorne, Ultraschall darueber nach vorne, zwei Antriebsmotoren,
+// Stuetzrad hinten.
+//
+// Zustandsautomat:
+//   FOLLOW_OUT  --Querstrich + Wand-->  wenden  -->  FOLLOW_BACK
+//   FOLLOW_BACK --Querstrich + Wand-->  FINISH (im Ziel stehen bleiben)
+//
+// Verfahren (fuer die Doku, Regelwerk 1.3, 5.4 bis 5.6):
+//   - Kalibrierung: feste Offsets/Skalierung aus kalibrierung.nxc (5.4)
+//   - Lage der Linie: verhaeltnisbasiert aus der Differenz rechts-links,
+//     bezogen auf die Summe aller drei Sensoren (lichtunabhaengig)
+//   - Schwelle "voll weiss": Min-Max im Zeitfenster (1 s), laufend
+//     nachgefuehrt; Startwert aus einem Schwenk im Startbereich
+//   - Regler: PD (5.5), kein Bang-Bang
+// =====================================================================
+
+
+// ---------- Anschluesse ----------
+// 09.11.2026: IN_1 und IN_3 getauscht, weil der Roboter der Linie auswich
+// (Lenkrichtung war gespiegelt).
+#define SENSOR_L   IN_3     // Lichtsensor links
+#define SENSOR_M   IN_2     // Lichtsensor Mitte (Bezugssensor)
+#define SENSOR_R   IN_1     // Lichtsensor rechts
+#define SENSOR_US  IN_4     // Ultraschall nach vorne
+#define MOTOR_L    OUT_B    // Antrieb links
+#define MOTOR_R    OUT_A    // Antrieb rechts
+
+// ---------- Kalibrierwerte aus kalibrierung.nxc (5.4, zulaessig nach 5.6) ----------
+// Gemessen 09.11.2026 zu Hause (NICHT an der Teststrecke), Akku 7699 mV.
+// Messwerte je Port: IN_1 grau 32 / weiss 53, IN_2 30/52, IN_3 31/52.
+// Seit dem Tausch ist SENSOR_L = IN_3 und SENSOR_R = IN_1. An der Teststrecke neu messen.
+#define CAL_GREY_L     31    // Grauwert links  (IN_3)
+#define CAL_GREY_M     30    // Grauwert Mitte  (IN_2)
+#define CAL_GREY_R     32    // Grauwert rechts (IN_1)
+#define CAL_SCALE_L    104   // Skalierung links x100:  (52-30)*100/(52-31)
+#define CAL_SCALE_R    104   // Skalierung rechts x100: (52-30)*100/(53-32)
+#define MOTOR_R_FACTOR 964   // Faktor rechter Motor x1000: 1065/1104 Grad (rechts dreht schneller)
+                             // Totzone gemessen: links 4, rechts 6
+
+// ---------- Regelung (Bewegungsparameter, zulaessig nach 5.6) ----------
+#define LOOP_MS        15    // fester Takt der Regelschleife in ms
+#define BASE_POWER     40    // Grundleistung beim Linienfolgen (ueber der Totzone!)
+#define MAX_POWER      100   // Obergrenze der Motorleistung
+#define KP             50    // P-Anteil x100
+#define KD             200   // D-Anteil x100
+#define SEARCH_POWER   35    // Drehleistung beim Suchen und Wenden
+#define SLOW_PCT       50    // Tempo-Anpassung: bei vollem Fehler (|Position| = 100)
+                             // faehrt er um SLOW_PCT % langsamer als BASE_POWER.
+                             // 0 = immer BASE_POWER. Beispiel BASE 60, SLOW 50:
+                             // Gerade 60, staerkste Kurve 30.
+#define PEAK_KEEP      85    // Merkt sich den groessten Fehler der letzten Takte:
+                             // pro Takt bleiben 85 % davon erhalten (~100 ms Gedaechtnis)
+#define USE_SPEED_REG  0     // 1 = Drehzahlregelung der Firmware (zum Testen)
+
+// ---------- Einstellen am NXT mit den Tasten (NUR ZUM TESTEN) ----------
+// 1 = vor jeder Fahrt KP, KD und BASE_POWER mit den Tasten einstellen,
+//     waehrend der Fahrt bricht die orange Taste ab (zurueck ins Menue).
+// 0 = aus. FUER MEILENSTEIN UND WETTBEWERB AUF 0 SETZEN (Regelwerk 1.2, 6)
+//     und die besten Werte oben bei KP, KD, BASE_POWER fest eintragen.
+#define BUTTON_TUNING  1
+#define STEP_KP        5     // Schrittweite KP pro Tastendruck
+#define STEP_KD        20    // Schrittweite KD pro Tastendruck
+#define STEP_BASE      5     // Schrittweite BASE_POWER pro Tastendruck
+
+// ---------- Schwellenverfahren (Parameter zulaessig nach 5.6) ----------
+#define BLOCK_MS       250   // Laenge eines Blocks im Min-Max-Fenster
+#define BLOCKS         4     // Fenster = 4 x 250 ms = 1 s
+#define MIN_CONTRAST   10    // kleinster sinnvoller Abstand max - min
+#define WHITE_PCT      80    // "voll weiss" ab 80 % zwischen min und max
+#define RATIO_PCT      15    // Linie gesehen, wenn hellster Sensor >= 15 %
+                             // heller ist als der dunkelste
+#define CROSS_COUNT    3     // so viele Takte hintereinander alle weiss = Querstrich
+
+// ---------- Strecke und Mechanik (Bewegungsparameter / Abstandsschwellen) ----------
+#define WHEEL_DIAM_MM  43    // Raddurchmesser in mm (NACHMESSEN)
+#define SWEEP_DEG      60    // Raddrehung beim Start-Schwenk (ca. 20 Grad Roboterdrehung)
+#define GAP_POS_LIMIT  40    // |Position| darunter: Linie war mittig -> Luecke
+#define GAP_MAX_MM     120   // so weit geradeaus durch eine Luecke (5 cm + 20 % + Reserve)
+#define WALL_CM        30    // Ultraschall: Wand naeher als 30 cm
+#define EMERGENCY_CM   8     // Notfall: so nah -> sofort als Wand werten (nur Meilenstein!)
+#define US_EVERY       4     // Ultraschall nur jeden 4. Takt lesen (~60 ms)
+#define BALL_POS_MM    0     // nach dem Querstrich so weit vor, bis Fanger unter der Ballausgabe
+#define BALL_WAIT_MS   0     // an der Wand warten; 6000, sobald der Fanger funktioniert (Ball nach 5 s)
+#define BACKUP_MM      100   // vor dem Wenden zuruecksetzen, damit der Querstrich nicht stoert
+#define TURN_MIN_DEG   400   // Raddrehung, bevor beim Wenden nach der Linie gesucht wird
+                             // (ca. 150 Grad Roboterdrehung: 150 * Spurbreite / Raddurchmesser)
+#define FINISH_EXTRA_MM 50   // nach dem Ziel-Querstrich noch so weit vor (Ziellinie sicher durchfahren)
+
+// ---------- Zustaende ----------
+#define ST_FOLLOW_OUT  0     // Hinfahrt
+#define ST_FOLLOW_BACK 1     // Rueckfahrt bis zum Ziel
+#define ST_FINISH      2     // im Ziel
+
+// ---------- Zustaende bei verlorener Linie ----------
+#define LOST_NONE      0     // Linie da
+#define LOST_GAP       1     // Luecke: geradeaus weiter
+#define LOST_SEARCH    2     // Kurve/Knick: auf der Stelle drehen
+
+
+// ---------- Globale Variablen ----------
+int valL, valM, valR;        // kalibrierte Helligkeit der drei Sensoren
+int distUS = 255;            // letzter Ultraschallwert in cm
+int usCounter = 0;           // zaehlt Takte bis zur naechsten Ultraschallmessung
+
+int blkMin[BLOCKS];          // Minimum je abgeschlossenem Block
+int blkMax[BLOCKS];          // Maximum je abgeschlossenem Block
+int curMin, curMax;          // Minimum/Maximum im laufenden Block
+unsigned long blockStart;    // Startzeit des laufenden Blocks
+int winMin, winMax;          // Minimum/Maximum im ganzen Fenster (Fahrbahn/Linie)
+int whiteLevel;              // dynamische Schwelle "voll weiss"
+
+bool lineSeen;               // sieht mindestens ein Sensor die Linie?
+int lastPosition = 0;        // letzte bekannte Lage der Linie
+int lastError = 0;           // Fehler im vorigen Takt (fuer den D-Anteil)
+int lostMode = LOST_NONE;    // Verhalten bei verlorener Linie
+long lostStart;              // Raddrehung beim Verlust der Linie
+int crossCounter = 0;        // Takte hintereinander "alle weiss"
+int state;                   // aktueller Zustand
+
+int kp = KP;                 // aktuelle Reglerwerte (per Tasten aenderbar,
+int kd = KD;                 //  sonst gleich den festen Werten oben)
+int basePower = BASE_POWER;
+int slowPct = SLOW_PCT;
+int peakPos = 0;             // groesster Fehler der letzten Takte (mit Vorzeichen)
+
+
+// =====================================================================
+// Hilfsfunktionen
+// =====================================================================
+
+// Begrenzt v auf den Bereich lo..hi
+int clamp(int v, int lo, int hi)
+{
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+// Betrag fuer long
+long absLong(long v)
+{
+    if (v < 0) return -v;
+    return v;
+}
+
+int maxOf3(int a, int b, int c)
+{
+    int m = a;
+    if (b > m) m = b;
+    if (c > m) m = c;
+    return m;
+}
+
+int minOf3(int a, int b, int c)
+{
+    int m = a;
+    if (b < m) m = b;
+    if (c < m) m = c;
+    return m;
+}
+
+// Mittlere Raddrehung beider Motoren in Grad (gefahrene Strecke)
+long wheelDeg()
+{
+    return (MotorRotationCount(MOTOR_L) + MotorRotationCount(MOTOR_R)) / 2;
+}
+
+// Rechnet eine Strecke in mm in Raddrehung (Grad) um:
+// Grad = mm * 360 / (pi * Durchmesser), pi als 314/100
+long mmToDeg(int mm)
+{
+    long x = mm;
+    return x * 36000 / (314 * WHEEL_DIAM_MM);
+}
+
+// Zeigt den aktuellen Zustand auf dem Display (nur beim Wechsel, kostet Zeit)
+void showState(string text)
+{
+    ClearScreen();
+    TextOut(0, LCD_LINE1, "SDP Meilenstein");
+    TextOut(0, LCD_LINE3, text);
+}
+
+
+// =====================================================================
+// Sensoren
+// =====================================================================
+
+// Sensoren einrichten
+void initSensors()
+{
+    SetSensorLight(SENSOR_L);     // Lichtsensoren mit eingeschalteter LED
+    SetSensorLight(SENSOR_M);
+    SetSensorLight(SENSOR_R);
+    SetSensorLowspeed(SENSOR_US); // Ultraschall (digital, I2C)
+}
+
+// Offset- und Skalierungskorrektur (Regelwerk 5.4):
+// gleicht einen Sensor an den mittleren an.
+int calibrate(int raw, int grey, int scale)
+{
+    return (raw - grey) * scale / 100 + CAL_GREY_M;
+}
+
+// Liest alle Sensoren und korrigiert die Lichtwerte.
+// Der Ultraschall ist langsam (~20-30 ms je Messung) und wird seltener gelesen.
+void readSensors()
+{
+    valL = calibrate(Sensor(SENSOR_L), CAL_GREY_L, CAL_SCALE_L);
+    valM = Sensor(SENSOR_M);      // Bezugssensor, keine Korrektur
+    valR = calibrate(Sensor(SENSOR_R), CAL_GREY_R, CAL_SCALE_R);
+
+    usCounter++;
+    if (usCounter >= US_EVERY)
+    {
+        usCounter = 0;
+        distUS = SensorUS(SENSOR_US);   // 255 = nichts erkannt
+    }
+}
+
+
+// =====================================================================
+// Dynamische Schwelle: Min-Max im Zeitfenster (Regelwerk 5.4)
+// =====================================================================
+// Das Fenster besteht aus BLOCKS Bloecken zu je BLOCK_MS. Im laufenden
+// Block werden Minimum und Maximum aller drei Sensoren nachgefuehrt.
+// Ist ein Block voll, faellt der aelteste heraus. So passt sich die
+// Schwelle an Licht, Schatten und Tunnel an, und alte Ausreisser wirken
+// hoechstens 1 s nach.
+
+// Startwert des Fensters aus der aktuellen Messung (wird danach laufend angepasst)
+void initThreshold()
+{
+    readSensors();
+    curMin = minOf3(valL, valM, valR);
+    curMax = maxOf3(valL, valM, valR);
+    for (int i = 0; i < BLOCKS; i++)
+    {
+        blkMin[i] = curMin;
+        blkMax[i] = curMax;
+    }
+    blockStart = CurrentTick();
+}
+
+void updateThreshold()
+{
+    int lo = minOf3(valL, valM, valR);
+    int hi = maxOf3(valL, valM, valR);
+    if (lo < curMin) curMin = lo;
+    if (hi > curMax) curMax = hi;
+
+    // Block voll: Fenster um einen Block weiterschieben
+    if (CurrentTick() - blockStart >= BLOCK_MS)
+    {
+        for (int i = 0; i < BLOCKS - 1; i++)
+        {
+            blkMin[i] = blkMin[i + 1];
+            blkMax[i] = blkMax[i + 1];
+        }
+        blkMin[BLOCKS - 1] = curMin;
+        blkMax[BLOCKS - 1] = curMax;
+        curMin = lo;               // neuer Block beginnt mit der aktuellen Messung
+        curMax = hi;
+        blockStart = CurrentTick();
+    }
+
+    // Minimum und Maximum ueber das ganze Fenster
+    winMin = curMin;
+    winMax = curMax;
+    for (int i = 0; i < BLOCKS; i++)
+    {
+        if (blkMin[i] < winMin) winMin = blkMin[i];
+        if (blkMax[i] > winMax) winMax = blkMax[i];
+    }
+
+    // Schwelle "voll weiss" bei WHITE_PCT Prozent zwischen Fahrbahn und Linie
+    whiteLevel = winMin + (winMax - winMin) * WHITE_PCT / 100;
+}
+
+
+// =====================================================================
+// Motoren
+// =====================================================================
+
+// Setzt beide Motoren. Begrenzt auf -MAX_POWER..MAX_POWER und gleicht
+// den rechten Motor mit dem Faktor aus der Kalibrierung an.
+void setMotorSpeed(int left, int right)
+{
+    left = clamp(left, -MAX_POWER, MAX_POWER);
+    right = clamp(right, -MAX_POWER, MAX_POWER);
+    long r = right;
+    right = clamp(r * MOTOR_R_FACTOR / 1000, -MAX_POWER, MAX_POWER);
+
+    if (USE_SPEED_REG == 1)
+    {
+        OnFwdReg(MOTOR_L, left, OUT_REGMODE_SPEED);
+        OnFwdReg(MOTOR_R, right, OUT_REGMODE_SPEED);
+    }
+    else
+    {
+        OnFwd(MOTOR_L, left);
+        OnFwd(MOTOR_R, right);
+    }
+}
+
+void stopMotors()
+{
+    Off(MOTOR_L);
+    Off(MOTOR_R);
+}
+
+// Dreht auf der Stelle um 'deg' Grad Raddrehung.
+// dir = +1: rechts herum, dir = -1: links herum.
+// Die Sensoren laufen weiter, damit das Schwellenfenster aktuell bleibt.
+void pivotDegrees(int dir, long deg)
+{
+    long startDeg = MotorRotationCount(MOTOR_L);   // "start" ist in NXC reserviert
+    setMotorSpeed(dir * SEARCH_POWER, -dir * SEARCH_POWER);
+    while (absLong(MotorRotationCount(MOTOR_L) - startDeg) < deg)
+    {
+        readSensors();
+        updateThreshold();
+        Wait(LOOP_MS);
+    }
+    stopMotors();
+}
+
+// Faehrt 'mm' Millimeter geradeaus (negativ = rueckwaerts)
+void driveDistance(int mm, int power)
+{
+    long target = mmToDeg(abs(mm));
+    int p = power;
+    if (mm < 0) p = -power;
+
+    long startDeg = wheelDeg();
+    setMotorSpeed(p, p);
+    while (absLong(wheelDeg() - startDeg) < target)
+    {
+        readSensors();
+        updateThreshold();
+        Wait(LOOP_MS);
+    }
+    stopMotors();
+}
+
+
+// =====================================================================
+// Linienfolgen
+// =====================================================================
+
+// Berechnet die Lage der Linie unter den Sensoren: -100 = ganz links,
+// 0 = mittig, +100 = ganz rechts. Verhaeltnisbasiert: Jeder Sensor zaehlt
+// mit seiner Helligkeit ueber der Fahrbahn (winMin); geteilt durch die
+// Summe, damit das Ergebnis nicht von der Gesamthelligkeit abhaengt
+// (Tunnel, Schatten, Steigung). Setzt ausserdem lineSeen.
+int calculateError()
+{
+    int l = valL - winMin;
+    int m = valM - winMin;
+    int r = valR - winMin;
+    if (l < 0) l = 0;
+    if (m < 0) m = 0;
+    if (r < 0) r = 0;
+
+    int hi = maxOf3(valL, valM, valR);
+    int lo = minOf3(valL, valM, valR);
+
+    // Linie gesehen, wenn
+    //  (a) ein Sensor deutlich heller ist als ein anderer (verhaeltnisbasiert), oder
+    //  (b) der hellste Sensor die dynamische Weiss-Schwelle erreicht.
+    bool ratioOk = (hi >= 5) && ((hi - lo) * 100 >= RATIO_PCT * hi);
+    bool whiteOk = (winMax - winMin >= MIN_CONTRAST) && (hi >= whiteLevel);
+    lineSeen = ratioOk || whiteOk;
+
+    int sum = l + m + r;
+    if (sum <= 0) return 0;
+    return clamp((r - l) * 100 / sum, -100, 100);
+}
+
+// PD-Regler (Regelwerk 5.5): Korrektur waechst mit der Abweichung (P)
+// und mit ihrer Aenderung pro Takt (D). Der feste Takt LOOP_MS sorgt
+// dafuer, dass der D-Anteil gleichmaessig wirkt.
+int updatePID(int error)
+{
+    long p = error;
+    long d = error - lastError;
+    lastError = error;
+    return (p * kp + d * kd) / 100;
+}
+
+// Linie verloren: Luecke oder Kurve/Knick?
+// War die Linie zuletzt mittig, ist es vermutlich eine Luecke -> geradeaus.
+// War sie seitlich, ist sie in einer Kurve/einem Knick seitlich
+// herausgelaufen -> auf der Stelle zu dieser Seite drehen.
+void handleLineLost()
+{
+    if (lostMode == LOST_NONE)
+    {
+        lostStart = wheelDeg();
+        // peakPos statt nur des letzten Werts: Bei hohem Tempo laeuft die
+        // Linie in einer Kurve so schnell heraus, dass der letzte Messwert
+        // schon wieder fast mittig aussehen kann.
+        if (abs(peakPos) < GAP_POS_LIMIT) lostMode = LOST_GAP;
+        else lostMode = LOST_SEARCH;
+    }
+
+    if (lostMode == LOST_GAP)
+    {
+        setMotorSpeed(basePower, basePower);
+        // Luecke zu lang: doch suchen
+        if (absLong(wheelDeg() - lostStart) > mmToDeg(GAP_MAX_MM))
+        {
+            lostMode = LOST_SEARCH;
+        }
+    }
+
+    if (lostMode == LOST_SEARCH)
+    {
+        int dir = 1;                       // ohne Information: rechts herum
+        if (peakPos < 0) dir = -1;
+        setMotorSpeed(dir * SEARCH_POWER, -dir * SEARCH_POWER);
+    }
+}
+
+// Ein Regelschritt beim Linienfolgen
+void followLine()
+{
+    int position = calculateError();
+
+    if (lineSeen)
+    {
+        if (lostMode != LOST_NONE)
+        {
+            lostMode = LOST_NONE;
+            lastError = position;          // kein D-Sprung nach dem Wiederfinden
+        }
+        lastPosition = position;
+
+        // Groessten Fehler der letzten Takte merken (fuer handleLineLost)
+        if (abs(position) >= abs(peakPos)) peakPos = position;
+        else peakPos = peakPos * PEAK_KEEP / 100;
+
+        // Tempo-Anpassung: je groesser der Fehler, desto langsamer.
+        // speed = basePower * (1 - slowPct/100 * |Fehler|/100)
+        long slow = basePower;
+        slow = slow * slowPct * abs(position) / 10000;
+        int speed = basePower - slow;
+
+        int correction = updatePID(position);
+        setMotorSpeed(speed + correction, speed - correction);
+    }
+    else
+    {
+        handleLineLost();
+    }
+}
+
+
+// =====================================================================
+// Querstrich und Wand
+// =====================================================================
+
+// Querstrich + Wand erkannt? Querstrich: alle drei Sensoren gleichzeitig
+// "voll weiss", mehrere Takte hintereinander (filtert Zufallstreffer an
+// Knicken). Zusaetzlich muss der Ultraschall eine Wand sehen.
+bool detectWall()
+{
+    bool allWhite = (winMax - winMin >= MIN_CONTRAST)
+                    && valL >= whiteLevel && valM >= whiteLevel && valR >= whiteLevel;
+    if (allWhite) crossCounter++;
+    else crossCounter = 0;
+
+    if (crossCounter >= CROSS_COUNT && distUS < WALL_CM) return true;
+
+    // Notfall fuer den Meilenstein: Wand direkt voraus.
+    // Fuer den Wettbewerb ersetzen (dort stehen Hindernisse auf der Strecke!).
+    if (distUS < EMERGENCY_CM) return true;
+
+    return false;
+}
+
+// Ballaufnahme (optional beim Meilenstein): Fanger unter die Ausgabe
+// fahren und warten. Mit BALL_WAIT_MS = 0 wird nicht gewartet.
+void catchBall()
+{
+    if (BALL_POS_MM > 0) driveDistance(BALL_POS_MM, basePower);
+    stopMotors();
+    if (BALL_WAIT_MS > 0) Wait(BALL_WAIT_MS);
+}
+
+// Wenden an der Wand: zuruecksetzen, mindestens TURN_MIN_DEG drehen
+// (damit nicht der Querstrich als Linie erkannt wird), dann weiterdrehen,
+// bis die Linie wieder mittig unter den Sensoren liegt.
+void turnAround()
+{
+    driveDistance(-BACKUP_MM, basePower);
+    pivotDegrees(1, TURN_MIN_DEG);
+
+    setMotorSpeed(SEARCH_POWER, -SEARCH_POWER);
+    bool found = false;
+    while (!found)
+    {
+        readSensors();
+        updateThreshold();
+        int position = calculateError();
+        if (lineSeen && abs(position) < GAP_POS_LIMIT) found = true;
+        Wait(LOOP_MS);
+    }
+    stopMotors();
+
+    // Regler frisch starten
+    lastError = 0;
+    lastPosition = 0;
+    peakPos = 0;
+    lostMode = LOST_NONE;
+    crossCounter = 0;
+}
+
+// Ballabgabe in die Zielbox (optional beim Meilenstein, spaeter ergaenzen)
+void releaseBall()
+{
+    // TODO Wettbewerb: Ballabgabe-Mechanik ansteuern
+}
+
+// Im Ziel: Ziellinie sicher durchfahren, anhalten, Ball abgeben
+void finish()
+{
+    driveDistance(FINISH_EXTRA_MM, basePower);
+    stopMotors();
+    releaseBall();
+    showState("Ziel erreicht");
+    PlayTone(1047, 300);
+}
+
+
+// =====================================================================
+// Hauptprogramm
+// =====================================================================
+// ---------- Einstellen mit den NXT-Tasten (nur wenn BUTTON_TUNING 1) ----------
+// Menue mit vier Zeilen: KP, KD, BASE, START.
+//   Pfeil links/rechts: Wert der markierten Zeile verringern/erhoehen
+//                       (gedrueckt halten = schnell weiterzaehlen)
+//   orange:             naechste Zeile; auf START: Fahrt beginnen
+//   grau (dunkel):      Programm beenden (macht die Firmware selbst)
+
+// Zeigt das Menue; 'sel' ist die markierte Zeile (0=KP, 1=KD, 2=BASE, 3=START)
+void showTuning(int sel)
+{
+    ClearScreen();
+    TextOut(0, LCD_LINE1, "Tuning </>=Wert");
+    TextOut(0, LCD_LINE3, "  KP");
+    NumOut(54, LCD_LINE3, kp);
+    TextOut(0, LCD_LINE4, "  KD");
+    NumOut(54, LCD_LINE4, kd);
+    TextOut(0, LCD_LINE5, "  BASE");
+    NumOut(54, LCD_LINE5, basePower);
+    TextOut(0, LCD_LINE6, "  SLOW%");
+    NumOut(54, LCD_LINE6, slowPct);
+    TextOut(0, LCD_LINE7, "  START");
+    TextOut(0, LCD_LINE8, "orange: weiter");
+
+    // Pfeil vor die markierte Zeile
+    if (sel == 0) TextOut(0, LCD_LINE3, ">");
+    if (sel == 1) TextOut(0, LCD_LINE4, ">");
+    if (sel == 2) TextOut(0, LCD_LINE5, ">");
+    if (sel == 3) TextOut(0, LCD_LINE6, ">");
+    if (sel == 4) TextOut(0, LCD_LINE7, ">");
+}
+
+// Aendert den Wert der markierten Zeile um 'dir' Schritte (+1 oder -1)
+void changeValue(int sel, int dir)
+{
+    if (sel == 0) kp = clamp(kp + dir * STEP_KP, 0, 500);
+    if (sel == 1) kd = clamp(kd + dir * STEP_KD, 0, 2000);
+    if (sel == 2) basePower = clamp(basePower + dir * STEP_BASE, 0, MAX_POWER);
+    if (sel == 3) slowPct = clamp(slowPct + dir * 10, 0, 90);
+}
+
+// Menue vor dem Start. Kehrt zurueck, wenn auf START orange gedrueckt wird.
+void tuningMenu()
+{
+    int sel = 0;
+    bool go = false;
+    showTuning(sel);
+
+    while (!go)
+    {
+        if (ButtonPressed(BTNRIGHT, false))
+        {
+            changeValue(sel, 1);
+            showTuning(sel);
+            Wait(250);               // gedrueckt halten: alle 250 ms ein Schritt
+        }
+        else if (ButtonPressed(BTNLEFT, false))
+        {
+            changeValue(sel, -1);
+            showTuning(sel);
+            Wait(250);
+        }
+        else if (ButtonPressed(BTNCENTER, false))
+        {
+            until (!ButtonPressed(BTNCENTER, false));
+            PlayTone(880, 60);
+            if (sel == 4) go = true;
+            else
+            {
+                sel++;
+                showTuning(sel);
+            }
+        }
+        Wait(20);
+    }
+
+    // Kurz warten, damit man die Hand vom Roboter nehmen kann
+    showState("Start in 1 s");
+    Wait(1000);
+}
+
+// Eine komplette Fahrt: Start-Schwenk, Hinfahrt, Wenden, Rueckfahrt, Ziel.
+// Mit BUTTON_TUNING bricht die orange Taste die Fahrt ab.
+void runCourse()
+{
+    // Regler- und Zustandsvariablen fuer eine neue Fahrt zuruecksetzen
+    lastError = 0;
+    lastPosition = 0;
+    peakPos = 0;
+    lostMode = LOST_NONE;
+    crossCounter = 0;
+
+    // Start im Startbereich (8.1): Startwert der Schwelle messen und
+    // kurz links/rechts schwenken, damit die Sensoren Linie UND Fahrbahn
+    // sehen. Dauert etwa 1-2 s (Startlinie muss nach 20 s erreicht sein).
+    showState("Kalibrieren");
+    initThreshold();
+    pivotDegrees(-1, SWEEP_DEG);
+    pivotDegrees(1, 2 * SWEEP_DEG);
+    pivotDegrees(-1, SWEEP_DEG);
+
+    state = ST_FOLLOW_OUT;
+    showState("Hinfahrt");
+
+    bool aborted = false;
+    unsigned long next = CurrentTick();
+    while (state != ST_FINISH && !aborted)
+    {
+        readSensors();
+        updateThreshold();
+
+        if (detectWall())
+        {
+            if (state == ST_FOLLOW_OUT)
+            {
+                showState("Wand: wenden");
+                catchBall();
+                turnAround();
+                state = ST_FOLLOW_BACK;
+                showState("Rueckfahrt");
+            }
+            else
+            {
+                state = ST_FINISH;
+            }
+            next = CurrentTick();
+        }
+        else
+        {
+            followLine();
+        }
+
+        // Testbetrieb: orange Taste bricht die Fahrt ab
+        if (BUTTON_TUNING == 1 && ButtonPressed(BTNCENTER, false))
+        {
+            until (!ButtonPressed(BTNCENTER, false));
+            aborted = true;
+        }
+
+        // Fester Takt: Der naechste Durchlauf beginnt genau LOOP_MS nach
+        // dem vorigen, egal wie lange die Arbeit gedauert hat.
+        next += LOOP_MS;
+        if (CurrentTick() > next) next = CurrentTick();   // Ueberlauf: nicht nachholen
+        until (CurrentTick() >= next);
+    }
+
+    if (aborted)
+    {
+        stopMotors();
+        PlayTone(440, 200);
+    }
+    else
+    {
+        finish();
+    }
+}
+
+task main()
+{
+    initSensors();
+    Wait(100);                       // Sensoren kurz anlaufen lassen
+
+    if (BUTTON_TUNING == 1)
+    {
+        // Testbetrieb: Menue -> Fahrt -> Menue -> ... (beenden: graue Taste)
+        while (true)
+        {
+            tuningMenu();
+            runCourse();
+            Wait(1000);
+        }
+    }
+    else
+    {
+        // Meilenstein/Wettbewerb: genau eine Fahrt mit den festen Werten
+        runCourse();
+        until (ButtonPressed(BTNCENTER, false));   // Programm laufen lassen, bis Taste
+    }
+}

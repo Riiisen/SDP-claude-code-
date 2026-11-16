@@ -1,0 +1,64 @@
+// sensortest.nxc - Beispiel von Claude, um NXC kennenzulernen (kein Wettbewerbscode)
+// Zeigt alle Sensorwerte live auf dem Display, vorher kurzer Motortest.
+//
+// Anschluesse (an euren Aufbau anpassen!):
+//   IN_1 = Lichtsensor links, IN_2 = Lichtsensor Mitte, IN_3 = Lichtsensor rechts
+//   IN_4 = Ultraschallsensor
+//   OUT_B = Motor links, OUT_A = Motor rechts
+
+// Globale Variablen fuer die Messwerte (in Python: einfach x = 0, hier mit Typ davor)
+int links;
+int mitte;
+int rechts;
+int abstand;
+
+// Sensoren einmal einrichten
+void initSensors()
+{
+    SetSensorLight(IN_1);      // Lichtsensor, eigene rote LED an
+    SetSensorLight(IN_2);
+    SetSensorLight(IN_3);
+    SetSensorLowspeed(IN_4);   // Ultraschall ist ein digitaler Sensor
+}
+
+// Alle Sensoren einmal auslesen
+void readSensors()
+{
+    links   = Sensor(IN_1);    // reflektierte Helligkeit, 0 bis 100
+    mitte   = Sensor(IN_2);
+    rechts  = Sensor(IN_3);
+    abstand = SensorUS(IN_4);  // Abstand in cm, 255 = nichts erkannt
+}
+
+// Messwerte auf dem Display anzeigen
+void showValues()
+{
+    ClearScreen();
+    TextOut(0, LCD_LINE1, "Links:");
+    NumOut(60, LCD_LINE1, links);
+    TextOut(0, LCD_LINE2, "Mitte:");
+    NumOut(60, LCD_LINE2, mitte);
+    TextOut(0, LCD_LINE3, "Rechts:");
+    NumOut(60, LCD_LINE3, rechts);
+    TextOut(0, LCD_LINE5, "Abstand:");
+    NumOut(60, LCD_LINE5, abstand);
+}
+
+// Hauptprogramm: in NXC heisst es immer task main()
+task main()
+{
+    initSensors();
+
+    // Motortest: 1 Sekunde mit 30 % Leistung vorwaerts (Roboter auf den Boden stellen!)
+    OnFwd(OUT_AB, 30);
+    Wait(1000);                // Wartezeit in Millisekunden
+    Off(OUT_AB);
+
+    // Endlos messen und anzeigen, bis die orange Taste gedrueckt wird
+    while (!ButtonPressed(BTNCENTER, false))
+    {
+        readSensors();
+        showValues();
+        Wait(100);             // 10-mal pro Sekunde aktualisieren
+    }
+}

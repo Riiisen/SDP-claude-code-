@@ -1,0 +1,381 @@
+// =====================================================================
+// pid-messfahrt.nxc - Startwerte fuer KP und KD aus einer Messfahrt von Hand
+// =====================================================================
+// Geschrieben mit Claude (09.11.2026).
+//
+// Der Roboter wird von Hand geschoben (Motoren laufen frei) und misst:
+//   - Kontrast Linie/Fahrbahn
+//   - Bereich der Linienposition (wie weit der Fehler ausschlaegt)
+//   - Rauschen der Position im Stillstand auf der Linie
+// Daraus berechnet er STARTWERTE fuer KP und KD (Formeln unten).
+//
+// WICHTIG: Die optimalen Werte haengen auch davon ab, wie schnell Motoren
+// und Roboter reagieren. Das laesst sich beim Schieben nicht messen.
+// Die Startwerte also eintragen und danach beim Fahren feinjustieren.
+//
+// Ablauf (jeweils orange Taste):
+//   1. Roboter auf die Linie stellen, Taste.
+//   2. ROLLEN: Roboter von Hand die Linie entlang schieben, auch durch
+//      Kurven, und mehrmals langsam quer ueber die Linie hin und her,
+//      bis jeweils ein aeusserer Sensor die Linie gerade noch sieht.
+//      Ende: Taste.
+//   3. STILL: Mittleren Sensor mittig auf die Linie stellen, Taste,
+//      2 s nicht bewegen.
+//   4. Ergebnis ablesen und KP/KD in meilenstein.nxc eintragen.
+//
+// Anschluesse, Kalibrierwerte und Parameter wie in meilenstein.nxc halten!
+// =====================================================================
+
+// ---------- Anschluesse (wie meilenstein.nxc) ----------
+#define SENSOR_L   IN_3
+#define SENSOR_M   IN_2
+#define SENSOR_R   IN_1
+#define MOTOR_L    OUT_B
+#define MOTOR_R    OUT_A
+
+// ---------- Kalibrierwerte (wie meilenstein.nxc) ----------
+#define CAL_GREY_L     31
+#define CAL_GREY_M     30
+#define CAL_GREY_R     32
+#define CAL_SCALE_L    104
+#define CAL_SCALE_R    104
+
+// ---------- Parameter (wie meilenstein.nxc) ----------
+#define LOOP_MS        15
+#define BASE_POWER     40
+#define MAX_POWER      100
+#define BLOCK_MS       250
+#define BLOCKS         4
+#define MIN_CONTRAST   10
+#define WHITE_PCT      80
+#define RATIO_PCT      15
+#define WHEEL_DIAM_MM  43
+
+// ---------- Parameter der Auswertung ----------
+#define STILL_MS       2000  // Dauer der Rauschmessung
+#define NOISE_POWER    5     // Rauschen darf ueber den D-Anteil hoechstens
+                             // so viel Motorleistung ausmachen
+#define KD_PER_KP      4     // Faustregel: KD etwa 4 x KP (pro Takt), wenn das Rauschen es zulaesst
+
+
+// ---------- Globale Variablen ----------
+int valL, valM, valR;
+int blkMin[BLOCKS];
+int blkMax[BLOCKS];
+int curMin, curMax;
+unsigned long blockStart;
+int winMin, winMax;
+int whiteLevel;
+bool lineSeen;
+
+// Ergebnisse
+int globalMin = 1000;        // dunkelster Wert der ganzen Rollphase
+int globalMax = -1000;       // hellster Wert der ganzen Rollphase
+int posMax = -100;           // groesste Position mit Linie (rechts)
+int posMin = 100;            // kleinste Position mit Linie (links)
+int lostCount = 0;           // wie oft die Linie verloren ging
+long sigma10 = 0;            // Rauschen der Position, in Zehnteln
+int suggestKP = 0;
+int suggestKD = 0;
+
+
+// =====================================================================
+// Hilfsfunktionen
+// =====================================================================
+
+int clamp(int v, int lo, int hi)
+{
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+int maxOf3(int a, int b, int c)
+{
+    int m = a;
+    if (b > m) m = b;
+    if (c > m) m = c;
+    return m;
+}
+
+int minOf3(int a, int b, int c)
+{
+    int m = a;
+    if (b < m) m = b;
+    if (c < m) m = c;
+    return m;
+}
+
+// Ganzzahlige Wurzel (abgerundet)
+long isqrt(long v)
+{
+    long s = 0;
+    while ((s + 1) * (s + 1) <= v) s++;
+    return s;
+}
+
+// Wartet auf Druecken UND Loslassen der orangen Taste
+void waitForButton()
+{
+    until (ButtonPressed(BTNCENTER, false));
+    until (!ButtonPressed(BTNCENTER, false));
+    PlayTone(880, 100);
+}
+
+void prompt(string line1, string line2, string line3)
+{
+    ClearScreen();
+    TextOut(0, LCD_LINE1, line1);
+    TextOut(0, LCD_LINE2, line2);
+    TextOut(0, LCD_LINE3, line3);
+    TextOut(0, LCD_LINE8, "weiter: orange");
+    waitForButton();
+}
+
+
+// =====================================================================
+// Sensoren und Schwelle (gleiche Logik wie meilenstein.nxc)
+// =====================================================================
+
+int calibrate(int raw, int grey, int scale)
+{
+    return (raw - grey) * scale / 100 + CAL_GREY_M;
+}
+
+void readSensors()
+{
+    valL = calibrate(Sensor(SENSOR_L), CAL_GREY_L, CAL_SCALE_L);
+    valM = Sensor(SENSOR_M);
+    valR = calibrate(Sensor(SENSOR_R), CAL_GREY_R, CAL_SCALE_R);
+}
+
+void initThreshold()
+{
+    readSensors();
+    curMin = minOf3(valL, valM, valR);
+    curMax = maxOf3(valL, valM, valR);
+    for (int i = 0; i < BLOCKS; i++)
+    {
+        blkMin[i] = curMin;
+        blkMax[i] = curMax;
+    }
+    blockStart = CurrentTick();
+}
+
+void updateThreshold()
+{
+    int lo = minOf3(valL, valM, valR);
+    int hi = maxOf3(valL, valM, valR);
+    if (lo < curMin) curMin = lo;
+    if (hi > curMax) curMax = hi;
+
+    if (CurrentTick() - blockStart >= BLOCK_MS)
+    {
+        for (int i = 0; i < BLOCKS - 1; i++)
+        {
+            blkMin[i] = blkMin[i + 1];
+            blkMax[i] = blkMax[i + 1];
+        }
+        blkMin[BLOCKS - 1] = curMin;
+        blkMax[BLOCKS - 1] = curMax;
+        curMin = lo;
+        curMax = hi;
+        blockStart = CurrentTick();
+    }
+
+    winMin = curMin;
+    winMax = curMax;
+    for (int i = 0; i < BLOCKS; i++)
+    {
+        if (blkMin[i] < winMin) winMin = blkMin[i];
+        if (blkMax[i] > winMax) winMax = blkMax[i];
+    }
+    whiteLevel = winMin + (winMax - winMin) * WHITE_PCT / 100;
+}
+
+int calculateError()
+{
+    int l = valL - winMin;
+    int m = valM - winMin;
+    int r = valR - winMin;
+    if (l < 0) l = 0;
+    if (m < 0) m = 0;
+    if (r < 0) r = 0;
+
+    int hi = maxOf3(valL, valM, valR);
+    int lo = minOf3(valL, valM, valR);
+
+    bool ratioOk = (hi >= 5) && ((hi - lo) * 100 >= RATIO_PCT * hi);
+    bool whiteOk = (winMax - winMin >= MIN_CONTRAST) && (hi >= whiteLevel);
+    lineSeen = ratioOk || whiteOk;
+
+    int sum = l + m + r;
+    if (sum <= 0) return 0;
+    return clamp((r - l) * 100 / sum, -100, 100);
+}
+
+
+// =====================================================================
+// Messphasen
+// =====================================================================
+
+// Phase ROLLEN: misst Kontrast, Positionsbereich und Linienverluste,
+// bis die orange Taste gedrueckt wird.
+void rollPhase()
+{
+    bool wasSeen = true;
+    unsigned long next = CurrentTick();
+
+    ClearScreen();
+    TextOut(0, LCD_LINE1, "ROLLEN");
+    TextOut(0, LCD_LINE2, "entlang + quer");
+    TextOut(0, LCD_LINE8, "Ende: orange");
+
+    while (!ButtonPressed(BTNCENTER, false))
+    {
+        readSensors();
+        updateThreshold();
+        int pos = calculateError();
+
+        int lo = minOf3(valL, valM, valR);
+        int hi = maxOf3(valL, valM, valR);
+        if (lo < globalMin) globalMin = lo;
+        if (hi > globalMax) globalMax = hi;
+
+        if (lineSeen)
+        {
+            if (pos > posMax) posMax = pos;
+            if (pos < posMin) posMin = pos;
+        }
+        if (wasSeen && !lineSeen) lostCount++;
+        wasSeen = lineSeen;
+
+        // aktuelle Position live anzeigen
+        TextOut(0, LCD_LINE4, "Pos:       ");
+        NumOut(42, LCD_LINE4, pos);
+
+        next += LOOP_MS;
+        if (CurrentTick() > next) next = CurrentTick();
+        until (CurrentTick() >= next);
+    }
+    until (!ButtonPressed(BTNCENTER, false));
+    PlayTone(880, 100);
+}
+
+// Phase STILL: Rauschen der Position im Stillstand mittig auf der Linie.
+// Das Schwellenfenster wird dafuer auf die Werte der Rollphase gesetzt
+// und eingefroren (sonst wuerde es sich an den Stillstand anpassen).
+void stillPhase()
+{
+    long n = 0;
+    long sum = 0;
+    long sumSq = 0;
+
+    winMin = globalMin;
+    winMax = globalMax;
+    whiteLevel = winMin + (winMax - winMin) * WHITE_PCT / 100;
+
+    ClearScreen();
+    TextOut(0, LCD_LINE1, "STILL halten");
+    Wait(300);                        // Wackeln vom Tastendruck abklingen lassen
+
+    unsigned long t0 = CurrentTick();
+    unsigned long next = t0;
+    while (CurrentTick() - t0 < STILL_MS)
+    {
+        readSensors();
+        long p = calculateError();
+        sum += p;
+        sumSq += p * p;
+        n++;
+
+        next += LOOP_MS;
+        if (CurrentTick() > next) next = CurrentTick();
+        until (CurrentTick() >= next);
+    }
+
+    // Varianz = Mittel der Quadrate - Quadrat des Mittels; x100 fuer Zehntel
+    if (n > 1)
+    {
+        long var100 = ((n * sumSq - sum * sum) / n) * 100 / n;
+        if (var100 < 0) var100 = 0;
+        sigma10 = isqrt(var100);
+    }
+    PlayTone(1047, 150);
+}
+
+// Startwerte berechnen:
+//   KP: Beim groessten gemessenen Fehler soll die Korrektur so gross sein,
+//       dass das innere Rad gerade stehen bleibt (Korrektur = BASE_POWER),
+//       ohne dass das aeussere ueber MAX_POWER kommt.
+//       KP(x100) = maxKorrektur * 100 / maxFehler
+//   KD: Faustregel KD = KD_PER_KP * KP, aber begrenzt durch das Rauschen:
+//       Rauschen im D-Anteil ~ 1,41 * sigma pro Takt, das darf hoechstens
+//       NOISE_POWER Motorleistung ausmachen:
+//       KD(x100) <= NOISE_POWER * 100 / (1,41 * sigma)
+void computeSuggestion()
+{
+    int errMax = posMax;
+    if (-posMin > errMax) errMax = -posMin;
+    if (errMax < 30) errMax = 30;     // Schutz, falls kaum quer gerollt wurde
+
+    int maxCorr = BASE_POWER;
+    if (MAX_POWER - BASE_POWER < maxCorr) maxCorr = MAX_POWER - BASE_POWER;
+
+    long kp = maxCorr;
+    kp = kp * 100 / errMax;
+    suggestKP = kp;
+
+    long kd = kp * KD_PER_KP;
+    if (sigma10 > 0)
+    {
+        // NOISE_POWER * 100 / (1,41 * sigma10/10) = NOISE_POWER * 100000 / (141 * sigma10)
+        long kdLimit = NOISE_POWER;
+        kdLimit = kdLimit * 100000 / (141 * sigma10);
+        if (kd > kdLimit) kd = kdLimit;
+    }
+    suggestKD = kd;
+}
+
+void showResults()
+{
+    ClearScreen();
+    TextOut(0,  LCD_LINE1, "Kontrast");
+    NumOut(66,  LCD_LINE1, globalMax - globalMin);
+    TextOut(0,  LCD_LINE2, "Pos max");
+    NumOut(66,  LCD_LINE2, posMax);
+    TextOut(0,  LCD_LINE3, "Pos min");
+    NumOut(66,  LCD_LINE3, posMin);
+    TextOut(0,  LCD_LINE4, "Verluste");
+    NumOut(66,  LCD_LINE4, lostCount);
+    TextOut(0,  LCD_LINE5, "Rausch/10");
+    NumOut(66,  LCD_LINE5, sigma10);
+    TextOut(0,  LCD_LINE7, "KP");
+    NumOut(24,  LCD_LINE7, suggestKP);
+    TextOut(48, LCD_LINE7, "KD");
+    NumOut(66,  LCD_LINE7, suggestKD);
+}
+
+
+// =====================================================================
+// Hauptprogramm
+// =====================================================================
+task main()
+{
+    SetSensorLight(SENSOR_L);
+    SetSensorLight(SENSOR_M);
+    SetSensorLight(SENSOR_R);
+    Float(MOTOR_L);                  // Motoren frei laufen lassen (Schieben)
+    Float(MOTOR_R);
+
+    prompt("PID-Messfahrt", "Roboter auf", "die Linie");
+    initThreshold();
+    rollPhase();
+
+    prompt("Mitte genau", "auf die Linie", "dann still");
+    stillPhase();
+
+    computeSuggestion();
+    showResults();
+    until (ButtonPressed(BTNCENTER, false));
+}

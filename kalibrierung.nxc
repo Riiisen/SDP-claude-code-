@@ -1,0 +1,196 @@
+// kalibrierung.nxc - Messprogramm fuer Lichtsensoren und Motoren
+// Geschrieben mit Claude (09.11.2026), noch nicht auf dem Brick getestet.
+// Die Ergebnisse erscheinen auf dem Display: abschreiben und in der Doku
+// begruenden (Regelwerk 5.6). Das Programm selbst faehrt nicht die Strecke.
+//
+// Ablauf (jeweils mit der orangen Taste weiter):
+//   1. Alle drei Lichtsensoren ueber GRAUE Fahrbahn stellen
+//   2. Alle drei Lichtsensoren ueber WEISSE Linie stellen
+//      (Tipp: Roboter quer zur Linie stellen, dann liegt die Sensorreihe
+//       laengs auf der Linie und alle drei sehen weiss)
+//   3. Sensor-Ergebnis ablesen
+//   4. Roboter auf den Boden stellen: er dreht sich und faehrt ca. 3 s geradeaus!
+//   5. Motor-Ergebnis ablesen
+
+// ---------- Anschluesse (an euren Aufbau anpassen) ----------
+#define SENSOR_L IN_1
+#define SENSOR_M IN_2
+#define SENSOR_R IN_3
+#define MOTOR_L  OUT_B
+#define MOTOR_R  OUT_A
+
+// ---------- Parameter der Messung ----------
+#define SAMPLES     50    // Messungen pro Mittelwert
+#define SAMPLE_WAIT 10    // ms zwischen zwei Messungen (50 x 10 ms = 0,5 s)
+#define STEP_POWER  2     // Leistungsschritt bei der Totzonen-Suche
+#define STEP_TIME   300   // ms pro Leistungsstufe
+#define MOVE_DEG    5     // ab so vielen Grad Drehung gilt das Rad als bewegt
+#define TEST_POWER  50    // Leistung fuer den Links-Rechts-Vergleich
+#define TEST_TIME   3000  // ms fuer den Links-Rechts-Vergleich
+
+// ---------- Ergebnisse (global, damit alle Funktionen sie sehen) ----------
+int greyL, greyM, greyR;     // Mittelwerte auf grauer Fahrbahn
+int whiteL, whiteM, whiteR;  // Mittelwerte auf weisser Linie
+int deadL, deadR;            // kleinste Leistung, bei der sich das Rad dreht
+long degL, degR;             // Drehwinkel beim Links-Rechts-Vergleich
+
+// Wartet, bis die orange Taste gedrueckt UND wieder losgelassen wurde.
+// Ohne das Loslassen wuerde ein Tastendruck gleich mehrere Schritte ausloesen.
+void waitForButton()
+{
+    until (ButtonPressed(BTNCENTER, false));
+    until (!ButtonPressed(BTNCENTER, false));
+    PlayTone(880, 100);      // kurzer Piep als Rueckmeldung
+}
+
+// Zeigt eine Anweisung in zwei Zeilen an und wartet auf die Taste
+void prompt(string line1, string line2)
+{
+    ClearScreen();
+    TextOut(0, LCD_LINE1, line1);
+    TextOut(0, LCD_LINE2, line2);
+    TextOut(0, LCD_LINE8, "weiter: orange");
+    waitForButton();
+}
+
+// Misst alle drei Lichtsensoren gleichzeitig und liefert die Mittelwerte.
+// Das & bedeutet: die Funktion schreibt direkt in die uebergebenen Variablen.
+void measureSensors(int &l, int &m, int &r)
+{
+    long sumL = 0;
+    long sumM = 0;
+    long sumR = 0;
+
+    Wait(300);               // Wackeln vom Tastendruck abklingen lassen
+    for (int i = 0; i < SAMPLES; i++)
+    {
+        sumL += Sensor(SENSOR_L);
+        sumM += Sensor(SENSOR_M);
+        sumR += Sensor(SENSOR_R);
+        Wait(SAMPLE_WAIT);
+    }
+    l = sumL / SAMPLES;
+    m = sumM / SAMPLES;
+    r = sumR / SAMPLES;
+}
+
+// Skalierungsfaktor x100: macht den Bereich grau..weiss eines Sensors
+// so gross wie beim mittleren Sensor. 0 bedeutet: Messung fehlerhaft.
+int scale100(int grey, int white)
+{
+    int range = white - grey;
+    if (range <= 0)
+    {
+        return 0;            // weiss nicht heller als grau -> neu messen
+    }
+    return (whiteM - greyM) * 100 / range;
+}
+
+// Zeigt das Ergebnis der Sensorkalibrierung an.
+// Korrektur im spaeteren Code:  wert = (roh - greyX) * skalX / 100 + greyM
+void showSensorResults()
+{
+    ClearScreen();
+    TextOut(0,  LCD_LINE1, "   grau weiss");
+    TextOut(0,  LCD_LINE2, "L");
+    NumOut(24,  LCD_LINE2, greyL);
+    NumOut(60,  LCD_LINE2, whiteL);
+    TextOut(0,  LCD_LINE3, "M");
+    NumOut(24,  LCD_LINE3, greyM);
+    NumOut(60,  LCD_LINE3, whiteM);
+    TextOut(0,  LCD_LINE4, "R");
+    NumOut(24,  LCD_LINE4, greyR);
+    NumOut(60,  LCD_LINE4, whiteR);
+    TextOut(0,  LCD_LINE5, "Offset L");
+    NumOut(66,  LCD_LINE5, greyM - greyL);
+    TextOut(0,  LCD_LINE6, "Offset R");
+    NumOut(66,  LCD_LINE6, greyM - greyR);
+    TextOut(0,  LCD_LINE7, "Skal L%");
+    NumOut(66,  LCD_LINE7, scale100(greyL, whiteL));
+    TextOut(0,  LCD_LINE8, "Skal R%");
+    NumOut(66,  LCD_LINE8, scale100(greyR, whiteR));
+}
+
+// Erhoeht die Leistung eines Motors schrittweise, bis er sich dreht.
+// Rueckgabe: diese Leistung (= obere Kante der Totzone), -1 = nie bewegt.
+int findDeadzone(byte motor)
+{
+    for (int power = 0; power <= 100; power += STEP_POWER)
+    {
+        long startDeg = MotorRotationCount(motor);   // "start" ist in NXC reserviert
+        OnFwd(motor, power);
+        Wait(STEP_TIME);
+        long moved = MotorRotationCount(motor) - startDeg;
+        if (moved >= MOVE_DEG)
+        {
+            Off(motor);
+            return power;
+        }
+    }
+    Off(motor);
+    return -1;               // Kabel oder Port pruefen
+}
+
+// Beide Motoren mit gleicher Leistung laufen lassen und Drehwinkel vergleichen
+void compareMotors()
+{
+    long startL = MotorRotationCount(MOTOR_L);
+    long startR = MotorRotationCount(MOTOR_R);
+
+    OnFwd(MOTOR_L, TEST_POWER);
+    OnFwd(MOTOR_R, TEST_POWER);
+    Wait(TEST_TIME);
+    Off(MOTOR_L);
+    Off(MOTOR_R);
+
+    degL = MotorRotationCount(MOTOR_L) - startL;
+    degR = MotorRotationCount(MOTOR_R) - startR;
+}
+
+// Zeigt das Ergebnis der Motorkalibrierung an.
+// Faktor R x1000: mit diesem Faktor/1000 die Leistung des rechten Motors
+// multiplizieren, damit er so weit dreht wie der linke.
+void showMotorResults()
+{
+    ClearScreen();
+    TextOut(0,  LCD_LINE1, "Totzone L");
+    NumOut(66,  LCD_LINE1, deadL);
+    TextOut(0,  LCD_LINE2, "Totzone R");
+    NumOut(66,  LCD_LINE2, deadR);
+    TextOut(0,  LCD_LINE3, "Grad L");
+    NumOut(54,  LCD_LINE3, degL);
+    TextOut(0,  LCD_LINE4, "Grad R");
+    NumOut(54,  LCD_LINE4, degR);
+    TextOut(0,  LCD_LINE5, "Faktor R");
+    if (degR > 0)
+    {
+        NumOut(66, LCD_LINE5, degL * 1000 / degR);
+    }
+    TextOut(0,  LCD_LINE7, "Akku mV");
+    NumOut(54,  LCD_LINE7, BatteryLevel());   // Ladestand mit notieren
+}
+
+task main()
+{
+    SetSensorLight(SENSOR_L);   // Lichtsensoren mit eingeschalteter LED
+    SetSensorLight(SENSOR_M);
+    SetSensorLight(SENSOR_R);
+
+    // Teil 1: Lichtsensoren
+    prompt("Sensoren ueber", "GRAU stellen");
+    measureSensors(greyL, greyM, greyR);
+    prompt("Sensoren ueber", "WEISS stellen");
+    measureSensors(whiteL, whiteM, whiteR);
+    showSensorResults();
+    waitForButton();
+
+    // Teil 2: Motoren
+    prompt("Auf den Boden!", "Faehrt gleich");
+    deadL = findDeadzone(MOTOR_L);
+    Wait(500);
+    deadR = findDeadzone(MOTOR_R);
+    Wait(500);
+    compareMotors();
+    showMotorResults();
+    waitForButton();
+}
